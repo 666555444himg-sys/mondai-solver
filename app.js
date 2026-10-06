@@ -61,10 +61,10 @@ const SYSTEM_PROMPT = `あなたは試験・問題集・クイズ・プログラ
 - 質問の言語に合わせて回答する (既定は日本語)。
 - 確信が持てない場合も最も可能性の高い答えを1行目に書き、解説に「確信度: 低」と理由を書く。`;
 
-const MAX_EDGE = 2048;           // 送る画像の最大辺
+const MAX_EDGE = 1600;           // 送る画像の最大辺 (スマホの回線でも速く送れる大きさ。Gemini も内部でこの程度に縮める)
 const THUMB_EDGE = 160;          // 履歴に表示する縮小画像の最大辺
 // 送る画像の WebP 画質 (WebP に対応していない iPhone では JPEG)
-const IMAGE_QUALITY = { fastest: 0.85, fast: 0.9, accurate: 0.95, max: 1 };
+const IMAGE_QUALITY = { fastest: 0.8, fast: 0.85, accurate: 0.88, max: 0.95 };
 const HISTORY_MAX = 30;
 
 let apiKey = "";
@@ -228,11 +228,11 @@ function sleep(ms, signal) {
   });
 }
 
-async function requestModel(model, contents, speed, signal) {
+async function requestModel(model, contents, speed, signal, system = systemPrompt(), useSearch = els.search.checked) {
   const send = (body) => fetch(apiUrl(model), {
     method: "POST",
     headers: { "Content-Type": "application/json", "x-goog-api-key": apiKey },
-    body: JSON.stringify({ systemInstruction: { parts: [{ text: systemPrompt() }] }, ...body }),
+    body: JSON.stringify({ systemInstruction: { parts: [{ text: system }] }, ...body }),
     signal,
   });
   // 画像1枚ごとに読み取りの細かさを付ける
@@ -247,7 +247,7 @@ async function requestModel(model, contents, speed, signal) {
     const partLevel = !noPartResolutionModels.has(model) && PART_RESOLUTION[speed];
     const media = !partLevel && !noMediaResolutionModels.has(model) && MEDIA_RESOLUTION[speed];
     if (media) generationConfig.mediaResolution = media;
-    const search = els.search.checked && !noSearchModels.has(model);
+    const search = useSearch && !noSearchModels.has(model);
     const res = await send({
       contents: partLevel ? withPartResolution(partLevel) : contents,
       generationConfig,
@@ -367,7 +367,8 @@ async function runSolve({ text, images, followUp }) {
     }
     answer = pick.text;
     renderAnswer(answer);
-    showCompare(checkAgainstSheet(answer));
+    showCompare(checkAgainstSheet(answer, currentJob?.quickRow));
+    if (currentJob) currentJob.done = true;
     const note = pick.finishReason === "MAX_TOKENS" ? " (出力が上限で途切れました)" : pick.finishReason === "SAFETY" ? " (安全フィルタで止まりました)" : "";
     const fallback = pick.model === MODELS[0] ? "" : " ※混雑のため別モデル";
     setStatus(`完了 ${elapsed()}秒 · ${pick.model}${fallback}${verdict}${note}`);
@@ -457,25 +458,35 @@ function sameAnswer(gemini, sheet) {
   return g === k || g.startsWith(k) || (k.length >= 2 && g.includes(k)) || (g.length >= 2 && k.startsWith(g));
 }
 
-// Gemini の答えと、シートから探した答えを並べて表示するための情報を作る
-function checkAgainstSheet(answer) {
-  if (!sheetRows.length || !answer) return null;
-  const gemini = stripSheetTag(answer).split("\n")[0].replace(/^\s*答え?\s*[:：]\s*/, "").trim();
-  const copied = answer.match(new RegExp(`${SHEET_TAG}(.*)$`, "m"))?.[1]?.trim();
-  if (!copied) return { kind: "none", gemini, sheet: "—", note: "問題文を読み取れなかったため、シートを探せませんでした" };
+// 書き写した問題文に一番近いシートの行 (似ていなければ null)
+function findSheetRow(copied) {
+  if (!copied || !sheetRows.length) return null;
   const grams = bigrams(copied);
   let best = null, bestScore = 0;
   for (const r of sheetRows) {
     const score = similarity(grams, r.grams);
     if (score > bestScore) [best, bestScore] = [r, score];
   }
-  if (!best || bestScore < SHEET_MATCH_MIN) {
-    return { kind: "none", gemini, sheet: "見つかりません", note: `シートに同じ問題がありませんでした (読み取った問題: 「${copied.slice(0, 40)}」)` };
+  return bestScore >= SHEET_MATCH_MIN ? best : null;
+}
+
+const sheetWhere = (row) => `シート ${row.row}行目「${row.question.slice(0, 40)}${row.question.length > 40 ? "…" : ""}」`;
+
+// Gemini の答えと、シートから探した答えを並べて表示するための情報を作る
+// fallbackRow: 先に軽いモデルで探しておいた行 (Gemini の書き写しで見つからなかったときに使う)
+function checkAgainstSheet(answer, fallbackRow = null) {
+  if (!sheetRows.length || !answer) return null;
+  const gemini = stripSheetTag(answer).split("\n")[0].replace(/^\s*答え?\s*[:：]\s*/, "").trim();
+  const copied = answer.match(new RegExp(`${SHEET_TAG}(.*)$`, "m"))?.[1]?.trim();
+  const best = findSheetRow(copied) ?? fallbackRow;
+  if (!best) {
+    return copied
+      ? { kind: "none", gemini, sheet: "見つかりません", note: `シートに同じ問題がありませんでした (読み取った問題: 「${copied.slice(0, 40)}」)` }
+      : { kind: "none", gemini, sheet: "—", note: "問題文を読み取れなかったため、シートを探せませんでした" };
   }
-  const where = `シート ${best.row}行目「${best.question.slice(0, 40)}${best.question.length > 40 ? "…" : ""}」`;
   return sameAnswer(gemini, best.answer)
-    ? { kind: "ok", gemini, sheet: best.answer, note: `✅ 一致 · ${where}` }
-    : { kind: "ng", gemini, sheet: best.answer, note: `⚠ 答えが違います · ${where}` };
+    ? { kind: "ok", gemini, sheet: best.answer, note: `✅ 一致 · ${sheetWhere(best)}` }
+    : { kind: "ng", gemini, sheet: best.answer, note: `⚠ 答えが違います · ${sheetWhere(best)}` };
 }
 
 // state: null (シート未設定) / "pending" (解答中) / checkAgainstSheet の結果
@@ -640,8 +651,58 @@ async function solve(job) {
     await running;
   }
   if (seq !== solveSeq) return;
-  running = runSolve({ followUp: false, ...job }).finally(() => { running = null; });
+  currentJob = { seq, quickRow: null, done: false };
+  const started = performance.now();
+  const timer = setInterval(() => tickStatus(started), 1000);
+  quickSheetLookup(job, currentJob);
+  running = runSolve({ followUp: false, ...job }).finally(() => { running = null; clearInterval(timer); });
   await running;
+}
+
+// 考えている間も経過秒数を出して、止まっていないことが分かるようにする
+function tickStatus(started) {
+  if (!els.status.classList.contains("busy")) return;
+  const base = els.status.textContent.replace(/ \(\d+秒\)$/, "");
+  if (!/解いています|検証しています/.test(base)) return;
+  els.status.textContent = `${base} (${Math.round((performance.now() - started) / 1000)}秒)`;
+}
+
+// ---- 解答シートの答えを先に出す ----
+// 深く考える Gemini の解答を待たずに、速いモデルで問題文の冒頭だけを書き写してシートを探す
+const QUICK_MODELS = ["gemini-flash-lite-latest", "gemini-flash-latest"];
+const QUICK_PROMPT = "画像に写っている最初の問題について、問題番号と問題文の最初の60文字ほどを、画像のとおり1行で書き写してください。問題は解かないでください。書き写した1行だけを出力します。";
+let currentJob = null;           // {seq, quickRow, done}
+
+async function quickTranscribe(images, signal) {
+  const contents = [{ role: "user", parts: toParts({ text: "書き写してください。", images: images.slice(0, 1) }) }];
+  for (const model of QUICK_MODELS) {
+    try {
+      const res = await requestModel(model, contents, "fastest", signal, QUICK_PROMPT, false);
+      if (!res.ok) continue;
+      let text = "";
+      await readStream(res, (t) => { text += t; });
+      if (text.trim()) return text.trim();
+    } catch (err) {
+      if (err.name === "AbortError") throw err;
+    }
+  }
+  return "";
+}
+
+async function quickSheetLookup(job, cur) {
+  if (!sheetRows.length) return;
+  const signal = AbortSignal.timeout?.(20_000);
+  let copied = job.text;
+  if (job.images.length) copied = await quickTranscribe(job.images, signal).catch(() => "");
+  const row = findSheetRow(copied);
+  cur.quickRow = row;
+  if (cur.seq !== solveSeq || cur.done) return; // 本解答がもう出ているか、次の問題に移った
+  showCompare({
+    kind: "early",
+    gemini: "考え中…",
+    sheet: row ? row.answer : "見つかりません",
+    note: row ? `📊 先にシートから見つけました · ${sheetWhere(row)}` : (copied ? `シートに同じ問題が見つかりません (読み取った問題: 「${copied.slice(0, 40)}」)` : ""),
+  });
 }
 
 function loadImage(url) {
