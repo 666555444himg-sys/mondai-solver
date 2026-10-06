@@ -15,10 +15,12 @@ const els = {
   cropCancel: $("cropCancel"), cropDone: $("cropDone"),
 };
 
-// 混雑 (503) や回数上限 (429) のときは、次のモデルに切り替えて解く
-const MODELS = ["gemini-flash-latest", "gemini-flash-lite-latest", "gemini-2.5-flash", "gemini-2.5-flash-lite"];
-const FLASH_ONLY_RETRY_DELAYS_MS = [1500, 3000, 5000]; // Flash 固定のとき、混雑したら待ってやり直す間隔
-const RETRY_PRIMARY_AFTER_MS = 5 * 60 * 1000; // 切り替え後、この時間がたったら最初のモデルに戻す
+// 無料枠はモデルごとに別。上限に達したり混雑したりしたら、この順に切り替えて解く
+const MODELS = ["gemini-flash-latest", "gemini-2.5-flash", "gemini-flash-lite-latest", "gemini-2.5-flash-lite"];
+const FLASH_MODELS = MODELS.slice(0, 2); // Flash 固定のときに使うモデル (Lite には切り替えない)
+const BUSY_RETRY_DELAYS_MS = [1500, 3000]; // 混雑 (503) のとき、同じモデルでやり直すまでの待ち時間
+const SHORT_WAIT_SEC = 15;       // 1分あたりの上限が、これ以内に空くなら待って同じモデルでやり直す
+const exhaustedToday = new Map(); // 1日の無料枠を使い切ったモデル → その日付
 const API_ORIGIN = "https://generativelanguage.googleapis.com";
 const apiUrl = (model) => `${API_ORIGIN}/v1beta/models/${model}:streamGenerateContent?alt=sse`;
 // 正答率を優先し、「正確」でも最も深く考えさせる
@@ -73,8 +75,6 @@ let controller = null;
 let running = null;
 let solveSeq = 0;
 let warmedAt = -Infinity;
-let modelIndex = 0;
-let modelSwitchedAt = 0;
 let photo = null;                // 最後に撮った写真 {img, url} (範囲を選び直すため)
 const noThinkingModels = new Set(MODELS.filter((m) => m.startsWith("gemini-2.5")));
 const noBudgetModels = new Set();
@@ -169,7 +169,7 @@ function toParts(turn) {
 }
 
 function errorMessage(status, message) {
-  if (status === 429) return "無料枠の上限 (1分あたりの回数) に達しました。数十秒待ってください。";
+  if (status === 429) return "無料枠の上限に達しました。1分ほど待ってからやり直してください。";
   if (status === 503 || status === 500) return "Gemini が混み合っています (全モデルで失敗)。少し待ってから「📷 撮影して解く」を押してください。";
   if (status === 400 && /API key/i.test(message)) return "API キーが無効です。⚙ の設定からキーを設定し直してください。";
   if (status === 403) return "API キーに権限がありません。⚙ の設定からキーを確認してください。";
@@ -177,45 +177,70 @@ function errorMessage(status, message) {
 }
 
 // 回答をストリーミングで受け取り、届いた文字ごとに onText を呼ぶ。答えたモデル名などを返す
+// 無料枠はモデルごとに別なので、上限に達したら次のモデルに切り替える。
+// 1分あたりの上限なら少し待ってやり直し、1日の上限ならそのモデルは今日 (米国太平洋時間の0時まで) 使わない
 async function callGemini(contents, speed, signal, onText) {
-  if (els.flashOnly.checked) return callFlashOnly(contents, speed, signal, onText);
-  if (modelIndex > 0 && performance.now() - modelSwitchedAt > RETRY_PRIMARY_AFTER_MS) modelIndex = 0;
+  const today = quotaDay();
+  const order = (els.flashOnly.checked ? FLASH_MODELS : MODELS).filter((m) => exhaustedToday.get(m) !== today);
+  if (!order.length) throw new Error(dailyLimitMessage());
   let lastError;
-  for (let i = modelIndex; i < MODELS.length; i++) {
-    warmedAt = performance.now();
-    const res = await requestModel(MODELS[i], contents, speed, signal);
-    if (res.ok) {
-      if (i !== modelIndex) {
-        modelIndex = i;
-        modelSwitchedAt = performance.now();
+  for (let i = 0; i < order.length; i++) {
+    const model = order[i];
+    const hasNext = i + 1 < order.length;
+    let waitedForLimit = false;
+    for (let attempt = 0; ; attempt++) {
+      warmedAt = performance.now();
+      const res = await requestModel(model, contents, speed, signal);
+      if (res.ok) return { model, finishReason: await readStream(res, onText) };
+      const err = await res.json().catch(() => ({}));
+      lastError = { status: res.status, message: err.error?.message ?? res.statusText };
+      if (res.status === 429) {
+        const quota = quotaInfo(err);
+        if (quota.perDay) {
+          exhaustedToday.set(model, today);
+          break; // 次のモデルへ
+        }
+        // 1分あたりの上限: すぐ空くなら待って同じモデルで、空くまで長いなら次のモデルで解く
+        const wait = Math.min(60, Math.ceil(quota.retrySec ?? 20));
+        if ((hasNext && wait > SHORT_WAIT_SEC) || waitedForLimit) break;
+        waitedForLimit = true;
+        setStatus(`1分あたりの無料枠に達しました。${wait}秒待ってやり直します…`, "busy");
+        await sleep(wait * 1000, signal);
+        continue;
       }
-      return { model: MODELS[i], finishReason: await readStream(res, onText) };
+      if ([500, 503].includes(res.status) && attempt < BUSY_RETRY_DELAYS_MS.length) {
+        const delay = BUSY_RETRY_DELAYS_MS[attempt];
+        setStatus(`Gemini が混雑中… ${delay / 1000}秒後にやり直します`, "busy");
+        await sleep(delay, signal);
+        continue;
+      }
+      if ([404, 500, 503].includes(res.status)) break; // 次のモデルへ
+      throw new Error(errorMessage(res.status, lastError.message));
     }
-    const err = await res.json().catch(() => ({}));
-    lastError = { status: res.status, message: err.error?.message ?? res.statusText };
-    // 混雑・回数上限・サーバー不調・モデルなし なら次のモデルへ。それ以外 (キー不正など) は即エラー
-    if (![429, 500, 503, 404].includes(res.status)) break;
   }
-  modelIndex = 0; // 全部だめだったら、次回は最初のモデルから試す
+  if (order.every((m) => exhaustedToday.get(m) === today)) throw new Error(dailyLimitMessage());
   throw new Error(errorMessage(lastError.status, lastError.message));
 }
 
-// Flash 固定: 別モデルには切り替えず、混雑 (503/500) のときは少し待って同じモデルでやり直す
-async function callFlashOnly(contents, speed, signal, onText) {
-  const model = MODELS[0];
-  for (let attempt = 0; ; attempt++) {
-    warmedAt = performance.now();
-    const res = await requestModel(model, contents, speed, signal);
-    if (res.ok) return { model, finishReason: await readStream(res, onText) };
-    const err = await res.json().catch(() => ({}));
-    const delay = FLASH_ONLY_RETRY_DELAYS_MS[attempt];
-    if (![500, 503].includes(res.status)) throw new Error(errorMessage(res.status, err.error?.message ?? res.statusText));
-    if (delay === undefined) {
-      throw new Error(`Gemini Flash が混み合っています (${attempt + 1}回試しました)。少し待ってから「📷 撮影して解く」を押してください。混雑が続くときは⚙ の「Flash 固定」を外すと別のモデルで解けます。`);
-    }
-    setStatus(`Flash が混雑中… ${delay / 1000}秒後にやり直します (${attempt + 1}/${FLASH_ONLY_RETRY_DELAYS_MS.length})`, "busy");
-    await sleep(delay, signal);
-  }
+// 429 エラーの中身から、1日の上限か1分の上限か、何秒後に空くかを読み取る
+function quotaInfo(err) {
+  const details = err.error?.details ?? [];
+  const retry = details.find((d) => d["@type"]?.includes("RetryInfo"))?.retryDelay;
+  const ids = details.filter((d) => d["@type"]?.includes("QuotaFailure"))
+    .flatMap((d) => d.violations ?? []).map((v) => `${v.quotaId ?? ""} ${v.quotaMetric ?? ""}`).join(" ");
+  return { perDay: /per_?day|PerDay/i.test(ids), retrySec: retry ? parseFloat(retry) : null };
+}
+
+// 無料枠の「1日」は米国太平洋時間の0時に切り替わる
+const quotaDay = () => new Intl.DateTimeFormat("en-CA", { timeZone: "America/Los_Angeles" }).format(new Date());
+
+function dailyLimitMessage() {
+  const now = new Date();
+  const pt = new Date(now.toLocaleString("en-US", { timeZone: "America/Los_Angeles" }));
+  const msLeft = 86_400_000 - ((pt.getHours() * 60 + pt.getMinutes()) * 60 + pt.getSeconds()) * 1000;
+  const reset = new Date(now.getTime() + msLeft).toLocaleTimeString("ja-JP", { hour: "2-digit", minute: "2-digit", timeZone: "Asia/Tokyo" });
+  const hint = els.flashOnly.checked ? "「Flash 固定」を外すと、Lite モデルで続けて解けます。" : "";
+  return `今日の無料枠を使い切りました。${reset} ごろ (日本時間) にリセットされます。${hint}`;
 }
 
 function sleep(ms, signal) {
@@ -370,7 +395,7 @@ async function runSolve({ text, images, followUp }) {
     showCompare(checkAgainstSheet(answer, currentJob?.quickRow));
     if (currentJob) currentJob.done = true;
     const note = pick.finishReason === "MAX_TOKENS" ? " (出力が上限で途切れました)" : pick.finishReason === "SAFETY" ? " (安全フィルタで止まりました)" : "";
-    const fallback = pick.model === MODELS[0] ? "" : " ※混雑のため別モデル";
+    const fallback = pick.model === MODELS[0] ? "" : " ※上限・混雑のため別モデル";
     setStatus(`完了 ${elapsed()}秒 · ${pick.model}${fallback}${verdict}${note}`);
   } catch (err) {
     if (err.name === "AbortError") aborted = true;
@@ -669,7 +694,7 @@ function tickStatus(started) {
 
 // ---- 解答シートの答えを先に出す ----
 // 深く考える Gemini の解答を待たずに、速いモデルで問題文の冒頭だけを書き写してシートを探す
-const QUICK_MODELS = ["gemini-flash-lite-latest", "gemini-flash-latest"];
+const QUICK_MODELS = ["gemini-flash-lite-latest", "gemini-2.5-flash-lite"]; // 本解答 (Flash) の無料枠を減らさないよう Lite だけを使う
 const QUICK_PROMPT = "画像に写っている最初の問題について、問題番号と問題文の最初の60文字ほどを、画像のとおり1行で書き写してください。問題は解かないでください。書き写した1行だけを出力します。";
 let currentJob = null;           // {seq, quickRow, done}
 
