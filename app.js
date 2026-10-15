@@ -16,8 +16,11 @@ const els = {
 };
 
 // 無料枠はモデルごとに別。上限に達したり混雑したりしたら、この順に切り替えて解く
-const MODELS = ["gemini-flash-latest", "gemini-2.5-flash", "gemini-flash-lite-latest", "gemini-2.5-flash-lite"];
-const FLASH_MODELS = MODELS.slice(0, 2); // Flash 固定のときに使うモデル (Lite には切り替えない)
+// gemini-flash-latest は常に最新の Flash (2026年10月時点で 3.8 Flash)。その1日の無料枠は少ないので、
+// 1つ前の Flash (3.6) → 2.5 Flash (以前から使っているキーだけ使える) の順に切り替える
+const FLASH_MODELS = ["gemini-flash-latest", "gemini-3.6-flash", "gemini-2.5-flash"]; // Flash 固定のときに使うモデル
+const MODELS = [...FLASH_MODELS, "gemini-flash-lite-latest", "gemini-3.5-flash-lite", "gemini-2.5-flash-lite"];
+const unavailableModels = new Set(); // このキーでは使えなかったモデル (404。提供終了・新規受付終了など)
 const BUSY_RETRY_DELAYS_MS = [1500, 3000]; // 混雑 (503) のとき、同じモデルでやり直すまでの待ち時間
 const SHORT_WAIT_SEC = 15;       // 1分あたりの上限が、これ以内に空くなら待って同じモデルでやり直す
 const exhaustedToday = new Map(); // 1日の無料枠を使い切ったモデル → その日付
@@ -77,6 +80,7 @@ let solveSeq = 0;
 let warmedAt = -Infinity;
 let photo = null;                // 最後に撮った写真 {img, url} (範囲を選び直すため)
 const noThinkingModels = new Set(MODELS.filter((m) => m.startsWith("gemini-2.5")));
+const noMinimalModels = new Set();         // 思考レベル MINIMAL がないモデル (LOW で代用する)
 const noBudgetModels = new Set();
 const noMediaResolutionModels = new Set();
 const noSearchModels = new Set();
@@ -181,7 +185,7 @@ function errorMessage(status, message) {
 // 1分あたりの上限なら少し待ってやり直し、1日の上限ならそのモデルは今日 (米国太平洋時間の0時まで) 使わない
 async function callGemini(contents, speed, signal, onText) {
   const today = quotaDay();
-  const order = (els.flashOnly.checked ? FLASH_MODELS : MODELS).filter((m) => exhaustedToday.get(m) !== today);
+  const order = (els.flashOnly.checked ? FLASH_MODELS : MODELS).filter((m) => exhaustedToday.get(m) !== today && !unavailableModels.has(m));
   if (!order.length) throw new Error(dailyLimitMessage());
   let lastError;
   for (let i = 0; i < order.length; i++) {
@@ -214,11 +218,13 @@ async function callGemini(contents, speed, signal, onText) {
         await sleep(delay, signal);
         continue;
       }
+      if (res.status === 404) unavailableModels.add(model);
       if ([404, 500, 503].includes(res.status)) break; // 次のモデルへ
       throw new Error(errorMessage(res.status, lastError.message));
     }
   }
-  if (order.every((m) => exhaustedToday.get(m) === today)) throw new Error(dailyLimitMessage());
+  const usedUp = (m) => exhaustedToday.get(m) === today;
+  if (order.some(usedUp) && order.every((m) => usedUp(m) || unavailableModels.has(m))) throw new Error(dailyLimitMessage());
   throw new Error(errorMessage(lastError.status, lastError.message));
 }
 
@@ -267,7 +273,9 @@ async function requestModel(model, contents, speed, signal, system = systemPromp
   // 対応していない設定でエラーになったら、その設定を外してやり直す (外した設定は覚えておく)
   for (;;) {
     const generationConfig = {};
-    if (!noThinkingModels.has(model)) generationConfig.thinkingConfig = { thinkingLevel: THINKING[speed] ?? "MEDIUM" };
+    let level = THINKING[speed] ?? "MEDIUM";
+    if (level === "MINIMAL" && noMinimalModels.has(model)) level = "LOW"; // 3.8 Flash などは MINIMAL がない
+    if (!noThinkingModels.has(model)) generationConfig.thinkingConfig = { thinkingLevel: level };
     else if (!noBudgetModels.has(model)) generationConfig.thinkingConfig = { thinkingBudget: THINKING_BUDGET[speed] ?? -1 };
     const partLevel = !noPartResolutionModels.has(model) && PART_RESOLUTION[speed];
     const media = !partLevel && !noMediaResolutionModels.has(model) && MEDIA_RESOLUTION[speed];
@@ -284,6 +292,8 @@ async function requestModel(model, contents, speed, signal, system = systemPromp
       (partLevel ? noPartResolutionModels : noMediaResolutionModels).add(model);
     } else if (search && /search|grounding|tool/i.test(message)) {
       noSearchModels.add(model);
+    } else if (generationConfig.thinkingConfig?.thinkingLevel === "MINIMAL" && /think|minimal/i.test(message)) {
+      noMinimalModels.add(model);
     } else if (generationConfig.thinkingConfig && /think/i.test(message)) {
       (noThinkingModels.has(model) ? noBudgetModels : noThinkingModels).add(model);
     } else {
@@ -694,15 +704,16 @@ function tickStatus(started) {
 
 // ---- 解答シートの答えを先に出す ----
 // 深く考える Gemini の解答を待たずに、速いモデルで問題文の冒頭だけを書き写してシートを探す
-const QUICK_MODELS = ["gemini-flash-lite-latest", "gemini-2.5-flash-lite"]; // 本解答 (Flash) の無料枠を減らさないよう Lite だけを使う
+const QUICK_MODELS = ["gemini-flash-lite-latest", "gemini-3.5-flash-lite", "gemini-2.5-flash-lite"]; // 本解答 (Flash) の無料枠を減らさないよう Lite だけを使う
 const QUICK_PROMPT = "画像に写っている最初の問題について、問題番号と問題文の最初の60文字ほどを、画像のとおり1行で書き写してください。問題は解かないでください。書き写した1行だけを出力します。";
 let currentJob = null;           // {seq, quickRow, done}
 
 async function quickTranscribe(images, signal) {
   const contents = [{ role: "user", parts: toParts({ text: "書き写してください。", images: images.slice(0, 1) }) }];
-  for (const model of QUICK_MODELS) {
+  for (const model of QUICK_MODELS.filter((m) => !unavailableModels.has(m) && exhaustedToday.get(m) !== quotaDay())) {
     try {
       const res = await requestModel(model, contents, "fastest", signal, QUICK_PROMPT, false);
+      if (res.status === 404) unavailableModels.add(model);
       if (!res.ok) continue;
       let text = "";
       await readStream(res, (t) => { text += t; });
