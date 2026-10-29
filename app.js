@@ -173,11 +173,36 @@ function toParts(turn) {
 }
 
 function errorMessage(status, message) {
+  if (status === 0) return "Gemini から応答がありませんでした。通信状態を確認して、もう一度お試しください。";
   if (status === 429) return "無料枠の上限に達しました。1分ほど待ってからやり直してください。";
   if (status === 503 || status === 500) return "Gemini が混み合っています (全モデルで失敗)。少し待ってから「📷 撮影して解く」を押してください。";
   if (status === 400 && /API key/i.test(message)) return "API キーが無効です。⚙ の設定からキーを設定し直してください。";
   if (status === 403) return "API キーに権限がありません。⚙ の設定からキーを確認してください。";
   return `Gemini エラー ${status}: ${message}`;
+}
+
+// 応答が止まったときに待ち続けないための見張り。
+// 最初の文字が届くまで (深く考えている間) は長めに、届き始めてからは短めに待つ
+const FIRST_TEXT_TIMEOUT_MS = 90_000;
+const STALL_TIMEOUT_MS = 30_000;
+function linkedController(outer) {
+  const ctl = new AbortController();
+  if (outer.aborted) ctl.abort();
+  else outer.addEventListener("abort", () => ctl.abort(), { once: true });
+  return ctl;
+}
+function watchdog(outer) {
+  const ctl = linkedController(outer);
+  let timer = null;
+  return {
+    signal: ctl.signal,
+    timedOut: false,
+    arm(ms) {
+      clearTimeout(timer);
+      timer = setTimeout(() => { this.timedOut = true; ctl.abort(); }, ms);
+    },
+    stop() { clearTimeout(timer); },
+  };
 }
 
 // 回答をストリーミングで受け取り、届いた文字ごとに onText を呼ぶ。答えたモデル名などを返す
@@ -194,8 +219,30 @@ async function callGemini(contents, speed, signal, onText) {
     let waitedForLimit = false;
     for (let attempt = 0; ; attempt++) {
       warmedAt = performance.now();
-      const res = await requestModel(model, contents, speed, signal);
-      if (res.ok) return { model, finishReason: await readStream(res, onText) };
+      const wd = watchdog(signal);
+      wd.arm(FIRST_TEXT_TIMEOUT_MS);
+      let gotText = false;
+      let res;
+      try {
+        res = await requestModel(model, contents, speed, wd.signal);
+        if (res.ok) {
+          const finishReason = await readStream(res, (t) => {
+            gotText = true;
+            onText(t);
+          }, () => { if (gotText) wd.arm(STALL_TIMEOUT_MS); });
+          return { model, finishReason };
+        }
+      } catch (err) {
+        if (signal.aborted || !wd.timedOut) throw err; // 停止ボタン・次の問題・通信エラー
+        // 書き始めてから止まった: 届いた分 (1行目の答えは届いている) で終える
+        if (gotText) return { model, finishReason: "STALLED" };
+        // 何も返ってこない: 次のモデルで解き直す
+        lastError = { status: 0, message: "応答がありませんでした" };
+        if (hasNext) setStatus(`${model} から応答がないため、別のモデルで解き直します…`, "busy");
+        break;
+      } finally {
+        wd.stop();
+      }
       const err = await res.json().catch(() => ({}));
       lastError = { status: res.status, message: err.error?.message ?? res.statusText };
       if (res.status === 429) {
@@ -302,7 +349,7 @@ async function requestModel(model, contents, speed, signal, system = systemPromp
   }
 }
 
-async function readStream(res, onText) {
+async function readStream(res, onText, onActivity = () => {}) {
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
   let buf = "";
@@ -333,6 +380,7 @@ async function readStream(res, onText) {
       handleLine(buf.slice(0, nl));
       buf = buf.slice(nl + 1);
     }
+    onActivity(); // 届いたら見張りの時計を戻す
   }
   handleLine(buf + decoder.decode()); // 改行で終わらない最後の行
   return finishReason;
@@ -363,9 +411,10 @@ async function runSolve({ text, images, followUp }) {
   try {
     // 最初に書き始めた回答を画面に流す (多数決のときも待たずに表示する)
     let shown = -1;
-    const runs = Array.from({ length: votes }, (_, i) => {
+    const subs = Array.from({ length: votes }, () => linkedController(signal));
+    const runs = subs.map((sub, i) => {
       let text = "";
-      return callGemini(contents, speed, signal, (t) => {
+      return callGemini(contents, speed, sub.signal, (t) => {
         if (shown === -1) {
           shown = i;
           setStatus(`回答中… ${elapsed()}秒で表示開始${votes > 1 ? " (多数決の集計待ち)" : ""}`, "busy");
@@ -374,7 +423,8 @@ async function runSolve({ text, images, followUp }) {
         if (shown === i) renderAnswer(text);
       }).then((r) => ({ ...r, text: text.trim() }));
     });
-    const results = await Promise.allSettled(runs);
+    const results = await settleVotes(runs);
+    subs.forEach((sub) => sub.abort()); // 多数決が決まったら、残りの解答は止める
     if (signal.aborted) throw new DOMException("aborted", "AbortError");
     const ok = results.filter((r) => r.status === "fulfilled" && r.value.text).map((r) => r.value);
     if (!ok.length) throw results.find((r) => r.status === "rejected")?.reason ?? new Error("回答が空でした");
@@ -385,7 +435,7 @@ async function runSolve({ text, images, followUp }) {
       const { best, count } = majority(ok);
       if (ok.length > 1 && count * 2 > ok.length) {
         pick = best;
-        verdict = ` · ${ok.length}回中${count}回一致`;
+        verdict = ` · ${votes}回中${count}回一致`;
       } else if (ok.length > 1) {
         // 答えが割れたら、候補をすべて検証させて決める
         setStatus(`答えが割れたので検証しています… (${elapsed()}秒)`, "busy");
@@ -404,7 +454,7 @@ async function runSolve({ text, images, followUp }) {
     renderAnswer(answer);
     showCompare(checkAgainstSheet(answer, currentJob?.quickRow));
     if (currentJob) currentJob.done = true;
-    const note = pick.finishReason === "MAX_TOKENS" ? " (出力が上限で途切れました)" : pick.finishReason === "SAFETY" ? " (安全フィルタで止まりました)" : "";
+    const note = pick.finishReason === "MAX_TOKENS" ? " (出力が上限で途切れました)" : pick.finishReason === "SAFETY" ? " (安全フィルタで止まりました)" : pick.finishReason === "STALLED" ? " (途中で通信が止まりました)" : "";
     const fallback = pick.model === MODELS[0] ? "" : " ※上限・混雑のため別モデル";
     setStatus(`完了 ${elapsed()}秒 · ${pick.model}${fallback}${verdict}${note}`);
   } catch (err) {
@@ -421,6 +471,31 @@ async function runSolve({ text, images, followUp }) {
   } else if (aborted) {
     setStatus("停止しました");
   }
+}
+
+// 多数決の結果を待つ。全部そろうか、過半数が同じ答えになるか、最初の答えから一定時間たったら打ち切る
+const VOTE_GRACE_MS = 20_000;
+function settleVotes(runs) {
+  return new Promise((resolve) => {
+    const results = runs.map(() => ({ status: "pending" }));
+    let firstAt = null;
+    let timer = null;
+    const finish = () => { clearTimeout(timer); resolve(results.filter((r) => r.status !== "pending")); };
+    const check = () => {
+      const settled = results.filter((r) => r.status !== "pending");
+      if (settled.length === runs.length) return finish();
+      const ok = settled.filter((r) => r.status === "fulfilled" && r.value.text).map((r) => r.value);
+      if (ok.length && majority(ok).count * 2 > runs.length) return finish();
+      if (ok.length && firstAt === null) {
+        firstAt = performance.now();
+        timer = setTimeout(finish, VOTE_GRACE_MS);
+      }
+    };
+    runs.forEach((p, i) => p.then(
+      (value) => { results[i] = { status: "fulfilled", value }; check(); },
+      (reason) => { results[i] = { status: "rejected", reason }; check(); },
+    ));
+  });
 }
 
 // 1行目 (答え) を比べやすい形にそろえる: 全角/半角・空白・句読点・「答え:」の違いを無視
