@@ -4,7 +4,7 @@
 const $ = (id) => document.getElementById(id);
 const els = {
   setup: $("setup"), keyInput: $("keyInput"), sheetUrl: $("sheetUrl"), sheetStatus: $("sheetStatus"),
-  flashOnly: $("flashOnly"), saveBtn: $("saveBtn"), sheetReload: $("sheetReload"), settingsBtn: $("settingsBtn"),
+  geminiBox: $("geminiBox"), geminiBtn: $("geminiBtn"), geminiOpen: $("geminiOpen"), saveBtn: $("saveBtn"), sheetReload: $("sheetReload"), settingsBtn: $("settingsBtn"),
   sheetBadge: $("sheetBadge"), cameraInput: $("cameraInput"), photoInput: $("photoInput"),
   speed: $("speed"), search: $("search"),
   status: $("status"), final: $("final"), explain: $("explain"), stopBtn: $("stopBtn"),
@@ -210,7 +210,8 @@ function watchdog(outer) {
 // 1分あたりの上限なら少し待ってやり直し、1日の上限ならそのモデルは今日 (米国太平洋時間の0時まで) 使わない
 async function callGemini(contents, speed, signal, onText) {
   const today = quotaDay();
-  const order = (els.flashOnly.checked ? FLASH_MODELS : MODELS).filter((m) => exhaustedToday.get(m) !== today && !unavailableModels.has(m));
+  const order = MODELS.filter((m) => exhaustedToday.get(m) !== today && !unavailableModels.has(m));
+  // Flash を先に使い、Flash がすべて上限・使えないときだけ Lite で解く (深く考える設定はそのまま)
   if (!order.length) throw new Error(dailyLimitMessage());
   let lastError;
   for (let i = 0; i < order.length; i++) {
@@ -292,8 +293,7 @@ function dailyLimitMessage() {
   const pt = new Date(now.toLocaleString("en-US", { timeZone: "America/Los_Angeles" }));
   const msLeft = 86_400_000 - ((pt.getHours() * 60 + pt.getMinutes()) * 60 + pt.getSeconds()) * 1000;
   const reset = new Date(now.getTime() + msLeft).toLocaleTimeString("ja-JP", { hour: "2-digit", minute: "2-digit", timeZone: "Asia/Tokyo" });
-  const hint = els.flashOnly.checked ? "「Flash 固定」を外すと、Lite モデルで続けて解けます。" : "";
-  return `今日の無料枠を使い切りました。${reset} ごろ (日本時間) にリセットされます。${hint}`;
+  return `今日の無料枠を使い切りました。${reset} ごろ (日本時間) にリセットされます。下の「① 問題をコピー」から、学生プランの Gemini で続けられます。`;
 }
 
 function sleep(ms, signal) {
@@ -396,6 +396,7 @@ async function runSolve({ text, images, followUp }) {
   ];
 
   renderAnswer("");
+  offerGemini(null);
   showCompare("pending");
   const speed = els.speed.value;
   const votes = speed === "max" ? VOTES : 1;
@@ -455,11 +456,16 @@ async function runSolve({ text, images, followUp }) {
     showCompare(checkAgainstSheet(answer, currentJob?.quickRow));
     if (currentJob) currentJob.done = true;
     const note = pick.finishReason === "MAX_TOKENS" ? " (出力が上限で途切れました)" : pick.finishReason === "SAFETY" ? " (安全フィルタで止まりました)" : pick.finishReason === "STALLED" ? " (途中で通信が止まりました)" : "";
-    const fallback = pick.model === MODELS[0] ? "" : " ※上限・混雑のため別モデル";
+    const fallback = pick.model === MODELS[0] ? ""
+      : FLASH_MODELS.includes(pick.model) ? " ※上限・混雑のため別の Flash"
+      : " ※Flash の枠が尽きたため Lite で解答 (精度やや低め)";
     setStatus(`完了 ${elapsed()}秒 · ${pick.model}${fallback}${verdict}${note}`);
   } catch (err) {
     if (err.name === "AbortError") aborted = true;
-    else setStatus(err.message, "error");
+    else {
+      setStatus(err.message, "error");
+      offerGemini({ text, images });
+    }
   } finally {
     controller = null;
     els.stopBtn.hidden = true;
@@ -610,6 +616,49 @@ function showCompare(state) {
   els.verdict.textContent = state.note;
 }
 
+// ---- 学生プランの Gemini で解く (エラーや上限のとき) ----
+// ボタンを押したときだけ動く。問題の画像 (または文字) をコピーして gemini.google.com を開き、貼り付けて使ってもらう
+const GEMINI_URL = "https://gemini.google.com/app";
+let geminiJob = null;            // 解けなかった問題 {text, png}
+
+function imageToPng(img) {
+  return fetch(`data:${img.mimeType};base64,${img.data}`)
+    .then((r) => r.blob())
+    .then((b) => createImageBitmap(b))
+    .then((bmp) => {
+      const canvas = drawScaled(bmp, 0, 0, bmp.width, bmp.height, MAX_EDGE);
+      bmp.close();
+      return canvasToBlob(canvas, "image/png");
+    });
+}
+
+function offerGemini(job) {
+  geminiJob = job ? { text: job.text, png: job.images[0] ? imageToPng(job.images[0]) : null } : null;
+  els.geminiBox.hidden = !geminiJob;
+  if (els.geminiOpen) els.geminiOpen.hidden = true;
+}
+
+async function copyForGemini() {
+  const job = geminiJob;
+  if (!job) return false;
+  try {
+    if (job.png) await navigator.clipboard.write([new ClipboardItem({ "image/png": job.png })]);
+    else await navigator.clipboard.writeText(job.text || "");
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// iPhone では、押した瞬間でないと別の画面を開けないことがあるので「① コピー → ② 開く」の2回に分ける
+els.geminiBtn.onclick = async () => {
+  const copied = await copyForGemini();
+  els.geminiOpen.hidden = false;
+  setStatus(copied
+    ? "問題をコピーしました。「② Gemini を開く」を押して、入力欄に貼り付けて送信してください。"
+    : "コピーできませんでした。「② Gemini を開く」を押して、写真を添付して質問してください。");
+};
+
 // ---- 解答シートの読み込み ----
 // スマホのブラウザからは、共有設定が「リンクを知っている全員」のシートを CSV で読む
 function sheetCsvUrl(url) {
@@ -687,7 +736,6 @@ function loadSettings() {
   apiKey = store.get("apiKey", "");
   els.speed.value = store.get("speed", DEFAULT_SPEED);
   els.search.checked = store.get("search", false);
-  els.flashOnly.checked = store.get("flashOnly", true);
   const sheetUrl = store.get("sheetUrl", "");
   els.sheetUrl.value = sheetUrl;
   els.setup.hidden = !!apiKey;
@@ -713,7 +761,6 @@ els.saveBtn.onclick = () => {
     setSheetStatus("Gemini API キーを入力してください", "error");
     return;
   }
-  store.set("flashOnly", els.flashOnly.checked);
   const url = els.sheetUrl.value.trim();
   if (url !== store.get("sheetUrl", "")) {
     store.set("sheetUrl", url);

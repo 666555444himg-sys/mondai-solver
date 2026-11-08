@@ -129,3 +129,6 @@ main { padding: 12px 16px; display: flex; flex-direction: column; gap: 12px; max
 .crop-stage { position: relative; touch-action: none; user-select: none; -webkit-user-select: none; }
 #cropImg { display: block; width: 100%; height: auto; }
 .crop-rect { position: absolute; border: 2px solid var(--accent); background: rgba(240,138,75,.18); pointer-events: none; }
+
+.gemini-box { margin-top: 10px; display: flex; flex-direction: column; gap: 6px; }
+.button-link { display: inline-flex; align-items: center; padding: 8px 14px; border-radius: 8px; border: 1px solid var(--accent); color: var(--accent); font-weight: 700; text-decoration: none; }
