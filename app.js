@@ -26,16 +26,16 @@ const SHORT_WAIT_SEC = 15;       // 1分あたりの上限が、これ以内に�
 const exhaustedToday = new Map(); // 1日の無料枠を使い切ったモデル → その日付
 const API_ORIGIN = "https://generativelanguage.googleapis.com";
 const apiUrl = (model) => `${API_ORIGIN}/v1beta/models/${model}:streamGenerateContent?alt=sse`;
-// 正答率を優先し、「正確」でも最も深く考えさせる
-const THINKING = { fastest: "MINIMAL", fast: "LOW", accurate: "HIGH", max: "HIGH" };
+// 「正確」は30秒以内を目安に「中」で考えさせる。最も深い「高」は「最高精度」で使う
+const THINKING = { fastest: "MINIMAL", fast: "LOW", accurate: "MEDIUM", max: "HIGH" };
 // 思考レベル指定に対応していない 2.5 系モデル用の思考量 (トークン数、-1 はモデルにおまかせ)
-const THINKING_BUDGET = { fastest: 0, fast: 2048, accurate: 16384, max: -1 };
+const THINKING_BUDGET = { fastest: 0, fast: 2048, accurate: 8192, max: -1 };
 const DEFAULT_SPEED = "accurate";
 // 最高精度では同じ問題を並行して何回か解かせ、多数決で答えを決める (割れたら検証役がもう1回考える)
 const VOTES = 3;
 // 画像を読み取る細かさ。高いほど小さな文字・数式・図の読み間違いが減る (少し遅くなる)
 // Gemini 3 では画像1枚ごとに指定でき、ULTRA_HIGH (約2240トークン) は HIGH の2倍の細かさで読む
-const PART_RESOLUTION = { fast: "MEDIA_RESOLUTION_HIGH", accurate: "MEDIA_RESOLUTION_ULTRA_HIGH", max: "MEDIA_RESOLUTION_ULTRA_HIGH" };
+const PART_RESOLUTION = { fast: "MEDIA_RESOLUTION_HIGH", accurate: "MEDIA_RESOLUTION_HIGH", max: "MEDIA_RESOLUTION_ULTRA_HIGH" };
 // 画像ごとの指定ができないモデル (2.5 系) では、リクエスト全体でこちらを指定する
 const MEDIA_RESOLUTION = { fast: "MEDIA_RESOLUTION_MEDIUM", accurate: "MEDIA_RESOLUTION_HIGH", max: "MEDIA_RESOLUTION_HIGH" };
 // 最高精度では、画面全体に加えて上下に分割した拡大画像も送り、細かい文字を読みやすくする
